@@ -5,21 +5,18 @@ Publish from IA RAW item (FSPraw) into an existing target IA item (FSPneu).
 Input line (pipe-separated):
   Title | Speaker | Assistant(optional) | DD.MM.YYYY | Hour(optional, Berlin 0-23)
 
-Final filename (hour NEVER included):
+Final filename (hour NOT included):
   - With assistant: "<Title> <Speaker> mit <Assistant> DD.MM.YYYY.m4a"
   - Without:       "<Title> <Speaker> DD.MM.YYYY.m4a"
 
 Selection:
 - Read RAW list from https://archive.org/metadata/FSPraw
 - Parse RAW filename timestamp: GMTYYYYMMDD-HHMMSS_*.m4a (UTC)
-- Convert UTC -> Europe/Berlin
-- Match Berlin date:
+- Convert UTC -> Europe/Berlin, match date
     - If hour provided: choose closest by hour (minute tiebreak)
-    - If hour missing: choose Nth earliest based on STATE_PATH count (deterministic)
-
+    - If hour missing: deterministic Nth-earliest via STATE_PATH counter
 Upload:
 - PUT to https://s3.us.archive.org/FSPneu/<final_filename> (overwrite allowed)
-- Adds item metadata headers (note: item-level, not per-file).
 """
 
 from __future__ import annotations
@@ -94,9 +91,7 @@ def parse_line(line: str) -> ParsedLine:
     parts = [p.strip() for p in line.split("|")]
     parts = [p for p in parts if p != ""]
     if len(parts) < 4:
-        raise PublishError(
-            "Invalid line. Expected: Title | Speaker | Assistant? | DD.MM.YYYY | Hour?"
-        )
+        raise PublishError("Invalid line. Expected: Title | Speaker | Assistant? | DD.MM.YYYY | Hour?")
 
     maybe_hour = parts[-1]
     maybe_date = parts[-2] if len(parts) >= 2 else ""
@@ -212,13 +207,6 @@ def final_filename(p: ParsedLine) -> str:
     return f"{p.title} {p.speaker} {d}.m4a"
 
 
-def final_title_meta(p: ParsedLine) -> str:
-    d = p.lesson_date.strftime("%d.%m.%Y")
-    if p.assistant:
-        return f"{p.title} – {p.speaker} (mit {p.assistant}) – {d}"
-    return f"{p.title} – {p.speaker} – {d}"
-
-
 def download_raw(raw_identifier: str, filename: str, session: requests.Session) -> bytes:
     url = f"{IA_DOWNLOAD_BASE}/{raw_identifier}/{filename}"
     r = session.get(url, timeout=180)
@@ -281,10 +269,10 @@ def main() -> int:
 
     meta = {
         "mediatype": "audio",
-        "title": final_title_meta(p),
-        "date": p.lesson_date.isoformat(),
+        "title": "FSPneu Upload",  # keep stable item-level meta; filename carries details
         "language": "deu",
         "creator": "ProtokolFSP",
+        "date": p.lesson_date.isoformat(),
     }
 
     ia_put_with_metadata(
@@ -298,7 +286,6 @@ def main() -> int:
     )
 
     _safe_write_json(state_path, publish_state)
-
     print(json.dumps(
         {
             "ok": True,
