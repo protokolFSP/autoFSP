@@ -1,80 +1,253 @@
-name: Publish from IA RAW to FSPneu
+#!/usr/bin/env python3
+"""
+Sync Zoom cloud recording M4A files into a single Internet Archive RAW item (FSPraw).
 
-on:
-  repository_dispatch:
-    types: [publish_recording]
-  workflow_dispatch:
-    inputs:
-      line:
-        description: 'Tek satır: "Title | Speaker | Assistant? | DD.MM.YYYY | Hour"'
-        required: true
-        type: string
+Behavior:
+- Gets Zoom S2S OAuth token (account_credentials).
+- Lists recent recordings:
+    1) Tries Report API: GET /v2/report/cloud_recording
+    2) Falls back to:   GET /v2/users/me/recordings
+- For each meeting, uploads recording_files where file_type == "M4A" to IA item (S3 PUT).
+- Idempotency: uses STATE_PATH JSON with key=recording_file.id to skip already uploaded.
+"""
 
-permissions:
-  contents: write
+from __future__ import annotations
 
-concurrency:
-  group: publish-from-raw
-  cancel-in-progress: false
+import base64
+import json
+import os
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-jobs:
-  publish:
-    runs-on: ubuntu-latest
+import requests
 
-    env:
-      RAW_IA_IDENTIFIER: "FSPraw"
-      TARGET_IA_IDENTIFIER: "FSPneu"
-      STATE_PATH: ".publish_state.json"
-      IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
-      IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+ZOOM_TOKEN_URL = "https://zoom.us/oauth/token"
+ZOOM_REPORT_RECORDINGS_URL = "https://api.zoom.us/v2/report/cloud_recording"
+ZOOM_USER_RECORDINGS_URL = "https://api.zoom.us/v2/users/me/recordings"
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+IA_S3_BASE = "https://s3.us.archive.org"
+DEFAULT_PAGE_SIZE = 300
 
-      - name: Debug context (no secrets revealed)
-        run: |
-          echo "repo=${{ github.repository }}"
-          echo "event=${{ github.event_name }}"
-          echo "ref=${{ github.ref }}"
-          echo "actor=${{ github.actor }}"
-          echo "IA_ACCESS_KEY_available=${{ secrets.IA_ACCESS_KEY != '' }}"
-          echo "IA_SECRET_KEY_available=${{ secrets.IA_SECRET_KEY != '' }}"
 
-      - name: Guard - fail fast if secrets not injected
-        run: |
-          python -c "import os,sys; \
-          missing=[k for k in ['IA_ACCESS_KEY','IA_SECRET_KEY'] if not os.getenv(k)]; \
-          print('missing_env=' + ','.join(missing)); \
-          sys.exit(1 if missing else 0)"
+class SyncError(RuntimeError):
+    """Sync failure."""
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
+@dataclass(frozen=True)
+class Env:
+    ia_access_key: str
+    ia_secret_key: str
+    zoom_account_id: str
+    zoom_client_id: str
+    zoom_client_secret: str
+    raw_ia_identifier: str
+    lookback_minutes: int
+    state_path: str
 
-      - name: Publish selected raw recording to FSPneu
-        env:
-          LINE_FROM_DISPATCH: ${{ github.event.client_payload.line }}
-        run: |
-          python tools/publish_from_raw.py --line "${LINE_FROM_DISPATCH:-${{ inputs.line }}}"
 
-      - name: Commit publish state (if changed)
-        run: |
-          set -e
-          if git diff --quiet -- .publish_state.json; then
-            echo "No publish state changes."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .publish_state.json
-          git commit -m "chore: update publish state"
-          git push
+def _require_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise SyncError(f"Missing required env var: {name}")
+    return v
+
+
+def load_env() -> Env:
+    return Env(
+        ia_access_key=_require_env("IA_ACCESS_KEY"),
+        ia_secret_key=_require_env("IA_SECRET_KEY"),
+        zoom_account_id=_require_env("ZOOM_ACCOUNT_ID"),
+        zoom_client_id=_require_env("ZOOM_CLIENT_ID"),
+        zoom_client_secret=_require_env("ZOOM_CLIENT_SECRET"),
+        raw_ia_identifier=os.getenv("RAW_IA_IDENTIFIER", "FSPraw"),
+        lookback_minutes=int(os.getenv("LOOKBACK_MINUTES", "90")),
+        state_path=os.getenv("STATE_PATH", ".zoom_raw_state.json"),
+    )
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso_date(dt: datetime) -> str:
+    return dt.date().isoformat()
+
+
+def safe_write_json(path: str, data: Dict[str, Any]) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def load_state(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        return {"uploaded": {}}
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or "uploaded" not in data or not isinstance(data["uploaded"], dict):
+        raise SyncError(f"State file malformed: {path}")
+    return data
+
+
+def zoom_s2s_token(env: Env, session: requests.Session) -> str:
+    creds = f"{env.zoom_client_id}:{env.zoom_client_secret}".encode("utf-8")
+    auth = base64.b64encode(creds).decode("ascii")
+    url = f"{ZOOM_TOKEN_URL}?grant_type=account_credentials&account_id={env.zoom_account_id}"
+    r = session.post(url, headers={"Authorization": f"Basic {auth}"}, timeout=30)
+    if r.status_code != 200:
+        raise SyncError(f"Zoom token failed: HTTP {r.status_code} - {r.text[:400]}")
+    token = r.json().get("access_token")
+    if not token:
+        raise SyncError("Zoom token response missing access_token.")
+    return token
+
+
+def _zoom_get_json(
+    session: requests.Session, url: str, token: str, params: Dict[str, Any]
+) -> Tuple[int, Dict[str, Any], str]:
+    r = session.get(url, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=60)
+    text = r.text
+    try:
+        js = r.json() if r.content else {}
+    except Exception:
+        js = {}
+    return r.status_code, js, text
+
+
+def _fetch_all(session: requests.Session, token: str, base_url: str, from_date: str, to_date: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    next_page_token: Optional[str] = None
+    while True:
+        params: Dict[str, Any] = {"from": from_date, "to": to_date, "page_size": DEFAULT_PAGE_SIZE}
+        if next_page_token:
+            params["next_page_token"] = next_page_token
+
+        status, js, text = _zoom_get_json(session, base_url, token, params)
+        if status != 200:
+            raise SyncError(f"Zoom list failed ({base_url}): HTTP {status} - {text[:400]}")
+
+        meetings = js.get("meetings") or js.get("recordings") or []
+        if not isinstance(meetings, list):
+            raise SyncError(f"Zoom list unexpected shape from {base_url}.")
+
+        out.extend([m for m in meetings if isinstance(m, dict)])
+        next_page_token = js.get("next_page_token") or None
+        if not next_page_token:
+            break
+        time.sleep(0.2)
+    return out
+
+
+def list_recordings(session: requests.Session, token: str, from_date: str, to_date: str) -> Iterable[Dict[str, Any]]:
+    try:
+        yield from _fetch_all(session, token, ZOOM_REPORT_RECORDINGS_URL, from_date, to_date)
+        return
+    except SyncError as e:
+        msg = str(e)
+        if "HTTP 4" not in msg and "HTTP 5" not in msg:
+            raise
+        yield from _fetch_all(session, token, ZOOM_USER_RECORDINGS_URL, from_date, to_date)
+
+
+def iter_m4a_files(meeting: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    files = meeting.get("recording_files") or []
+    if not isinstance(files, list):
+        return
+    for rf in files:
+        if not isinstance(rf, dict):
+            continue
+        if (rf.get("file_type") or "").upper() == "M4A" and rf.get("download_url"):
+            yield rf
+
+
+def choose_remote_filename(rf: Dict[str, Any]) -> str:
+    name = rf.get("file_name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    fid = rf.get("id", "unknown")
+    return f"GMT00000000-000000_{fid}.m4a"
+
+
+def zoom_download(session: requests.Session, token: str, download_url: str) -> bytes:
+    r = session.get(download_url, headers={"Authorization": f"Bearer {token}"}, timeout=180)
+    if r.status_code != 200:
+        raise SyncError(f"Zoom download failed: HTTP {r.status_code} - {r.text[:400]}")
+    return r.content
+
+
+def ia_put(session: requests.Session, env: Env, identifier: str, filename: str, content: bytes) -> None:
+    url = f"{IA_S3_BASE}/{identifier}/{filename}"
+    headers = {
+        "Authorization": f"LOW {env.ia_access_key}:{env.ia_secret_key}",
+        "Content-Type": "audio/mp4",
+    }
+    r = session.put(url, data=content, headers=headers, timeout=240)
+    if r.status_code not in (200, 201):
+        raise SyncError(f"IA upload failed for {identifier}/{filename}: HTTP {r.status_code} - {r.text[:400]}")
+
+
+def main() -> int:
+    env = load_env()
+    session = requests.Session()
+
+    state = load_state(env.state_path)
+    uploaded: Dict[str, Any] = state["uploaded"]
+
+    token = zoom_s2s_token(env, session)
+
+    now = utc_now()
+    from_dt = now - timedelta(minutes=env.lookback_minutes)
+    from_date = iso_date(from_dt)
+    to_date = iso_date(now)
+
+    meetings = list(list_recordings(session, token, from_date, to_date))
+    print(f"[info] meetings_in_range={len(meetings)} from={from_date} to={to_date}")
+
+    uploaded_count = 0
+    skipped_count = 0
+
+    for m in meetings:
+        for rf in iter_m4a_files(m):
+            rid = str(rf.get("id") or "").strip()
+            if not rid:
+                continue
+            if rid in uploaded:
+                skipped_count += 1
+                continue
+
+            remote_name = choose_remote_filename(rf)
+            print(f"[info] Downloading Zoom M4A id={rid} name={remote_name}")
+            content = zoom_download(session, token, rf["download_url"])
+
+            print(f"[info] Uploading to IA RAW {env.raw_ia_identifier}/{remote_name} bytes={len(content)}")
+            ia_put(session, env, env.raw_ia_identifier, remote_name, content)
+
+            uploaded[rid] = {
+                "remote_name": remote_name,
+                "uploaded_at_utc": now.isoformat(),
+                "meeting_id": m.get("id"),
+                "meeting_uuid": m.get("uuid"),
+            }
+            uploaded_count += 1
+
+    state["uploaded"] = uploaded
+    safe_write_json(env.state_path, state)
+
+    print(f"[ok] Uploaded={uploaded_count} Skipped={skipped_count} State={env.state_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except SyncError as e:
+        print(f"[error] {e}", file=sys.stderr)
+        raise SystemExit(2)
+    except Exception as e:
+        print(f"[error] Unexpected: {e}", file=sys.stderr)
+        raise SystemExit(3)
