@@ -1,24 +1,19 @@
-name: Publish from IA RAW to FSPneu
+name: Zoom -> IA RAW (FSPraw)
 
 on:
-  repository_dispatch:
-    types: [publish_recording]
-  workflow_dispatch:
-    inputs:
-      line:
-        description: 'Tek satır (örn: "Bronchialkarzinom | Dr Murat | Dr Keskin | 22.02.2026 | 11")'
-        required: true
-        type: string
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
 
 permissions:
   contents: write
 
 concurrency:
-  group: publish-from-raw
+  group: zoom-to-ia-raw
   cancel-in-progress: false
 
 jobs:
-  publish:
+  sync:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -36,27 +31,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Publish selected raw recording to FSPneu
+      - name: Sync Zoom recordings to IA RAW
         env:
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+          ZOOM_ACCOUNT_ID: ${{ secrets.ZOOM_ACCOUNT_ID }}
+          ZOOM_CLIENT_ID: ${{ secrets.ZOOM_CLIENT_ID }}
+          ZOOM_CLIENT_SECRET: ${{ secrets.ZOOM_CLIENT_SECRET }}
           RAW_IA_IDENTIFIER: "FSPraw"
-          TARGET_IA_IDENTIFIER: "FSPneu"
-          STATE_PATH: ".publish_state.json"
-          LINE_FROM_DISPATCH: ${{ github.event.client_payload.line }}
+          LOOKBACK_MINUTES: "90"
+          STATE_PATH: ".zoom_raw_state.json"
         run: |
-          python tools/publish_from_raw.py \
-            --line "${LINE_FROM_DISPATCH:-${{ inputs.line }}}"
+          python tools/zoom_to_ia_raw_sync.py
 
-      - name: Commit publish state (if changed)
+      - name: Commit state (if changed)
         run: |
           set -e
-          if git diff --quiet -- .publish_state.json; then
-            echo "No publish state changes."
+          if git diff --quiet -- .zoom_raw_state.json; then
+            echo "No state changes."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .publish_state.json
-          git commit -m "chore: update publish state"
+          git add .zoom_raw_state.json
+          git commit -m "chore: update zoom raw sync state"
           git push
