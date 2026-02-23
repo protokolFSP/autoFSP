@@ -32,6 +32,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Check secrets availability (safe)
+        run: |
+          echo "IA_ACCESS_KEY_available=${{ secrets.IA_ACCESS_KEY != '' }}"
+          echo "IA_SECRET_KEY_available=${{ secrets.IA_SECRET_KEY != '' }}"
+          echo "ZOOM_CLIENT_ID_available=${{ secrets.ZOOM_CLIENT_ID != '' }}"    
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
