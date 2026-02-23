@@ -1,15 +1,13 @@
+# tools/zoom_to_ia_raw_sync.py
 #!/usr/bin/env python3
 """
-Sync Zoom cloud recording M4A files into Internet Archive RAW item (FSPraw).
+Zoom cloud recording M4A -> Internet Archive RAW (FSPraw)
 
-Key points:
-- Lists recordings via:
-    1) /v2/report/cloud_recording (preferred)
-    2) fallback: /v2/users/me/recordings
-- Selects M4A using file_type OR file_extension.
-- Builds RAW filename as GMTYYYYMMDD-HHMMSS_Recording.m4a when Zoom doesn't provide file_name.
-- Repairs legacy uploads named GMT00000000-000000_*.m4a by re-uploading once with correct name.
-- Idempotency via STATE_PATH JSON keyed by recording_file.id.
+Fixes:
+- Uses /v2/meetings/{uuid}/recordings to get reliable file_name + recording_start.
+- Generates RAW filename as GMTYYYYMMDD-HHMMSS_Recording.m4a if file_name missing.
+- If user deleted files on IA, re-uploads even if state says uploaded (checks IA metadata).
+- Idempotency keyed by recording_file.id in STATE_PATH (.zoom_raw_state.json).
 """
 
 from __future__ import annotations
@@ -17,23 +15,23 @@ from __future__ import annotations
 import base64
 import json
 import os
-import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from urllib.parse import quote
 
 import requests
 
 ZOOM_TOKEN_URL = "https://zoom.us/oauth/token"
 ZOOM_REPORT_RECORDINGS_URL = "https://api.zoom.us/v2/report/cloud_recording"
 ZOOM_USER_RECORDINGS_URL = "https://api.zoom.us/v2/users/me/recordings"
+ZOOM_MEETING_RECORDINGS_URL = "https://api.zoom.us/v2/meetings/{meeting_uuid}/recordings"
 
 IA_S3_BASE = "https://s3.us.archive.org"
+IA_META_URL = "https://archive.org/metadata/{identifier}"
 DEFAULT_PAGE_SIZE = 300
-
-LEGACY_ZERO_PREFIX = "GMT00000000-000000_"
 
 
 class SyncError(RuntimeError):
@@ -51,7 +49,6 @@ class Env:
     lookback_minutes: int
     state_path: str
     debug: bool
-    repair_legacy_zero_names: bool
 
 
 def _require_env(name: str) -> str:
@@ -72,7 +69,6 @@ def load_env() -> Env:
         lookback_minutes=int(os.getenv("LOOKBACK_MINUTES", "90")),
         state_path=os.getenv("STATE_PATH", ".zoom_raw_state.json"),
         debug=os.getenv("DEBUG", "0") == "1",
-        repair_legacy_zero_names=os.getenv("REPAIR_LEGACY_ZERO_NAMES", "1") == "1",
     )
 
 
@@ -102,22 +98,24 @@ def load_state(path: str) -> Dict[str, Any]:
     return data
 
 
-_ISO_FRACTION_RE = re.compile(r"(\.\d+)(Z|[+-]\d{2}:\d{2})$")
-
-
 def parse_zoom_dt(value: Any) -> Optional[datetime]:
-    """
-    Zoom timestamps may be:
-    - 2026-02-23T10:12:13Z
-    - 2026-02-23T10:12:13.123Z
-    - 2026-02-23T10:12:13+00:00
-    """
     if not isinstance(value, str) or not value.strip():
         return None
     s = value.strip()
-    s = _ISO_FRACTION_RE.sub(r"\2", s)  # strip .ms
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
+    # strip fractional seconds if present
+    if "." in s:
+        left, right = s.split(".", 1)
+        if "+" in right:
+            _, tz = right.split("+", 1)
+            s = f"{left}+{tz}"
+        elif "-" in right and right.count("-") >= 1 and ":" in right:
+            # rare
+            parts = right.split("-", 1)
+            s = f"{left}-{parts[1]}"
+        else:
+            s = left
     try:
         return datetime.fromisoformat(s).astimezone(timezone.utc)
     except Exception:
@@ -140,6 +138,21 @@ def zoom_s2s_token(env: Env, session: requests.Session) -> str:
     return token
 
 
+def ia_existing_files(identifier: str, session: requests.Session) -> Set[str]:
+    r = session.get(IA_META_URL.format(identifier=identifier), timeout=60)
+    if r.status_code != 200:
+        raise SyncError(f"IA metadata fetch failed for {identifier}: HTTP {r.status_code} - {r.text[:200]}")
+    js = r.json()
+    files = js.get("files") or []
+    if not isinstance(files, list):
+        return set()
+    out: Set[str] = set()
+    for f in files:
+        if isinstance(f, dict) and isinstance(f.get("name"), str):
+            out.add(f["name"])
+    return out
+
+
 def _zoom_get_json(
     session: requests.Session, url: str, token: str, params: Dict[str, Any]
 ) -> Tuple[int, Dict[str, Any], str]:
@@ -159,15 +172,12 @@ def _fetch_all(session: requests.Session, token: str, base_url: str, from_date: 
         params: Dict[str, Any] = {"from": from_date, "to": to_date, "page_size": DEFAULT_PAGE_SIZE}
         if next_page_token:
             params["next_page_token"] = next_page_token
-
         status, js, text = _zoom_get_json(session, base_url, token, params)
         if status != 200:
             raise SyncError(f"Zoom list failed ({base_url}): HTTP {status} - {text[:400]}")
-
         meetings = js.get("meetings") or js.get("recordings") or []
         if not isinstance(meetings, list):
             raise SyncError(f"Zoom list unexpected shape from {base_url}.")
-
         out.extend([m for m in meetings if isinstance(m, dict)])
         next_page_token = js.get("next_page_token") or None
         if not next_page_token:
@@ -176,54 +186,48 @@ def _fetch_all(session: requests.Session, token: str, base_url: str, from_date: 
     return out
 
 
-def list_recordings(session: requests.Session, token: str, from_date: str, to_date: str) -> Iterable[Dict[str, Any]]:
+def list_meetings(session: requests.Session, token: str, from_date: str, to_date: str) -> List[Dict[str, Any]]:
+    # Prefer report endpoint, fallback to users/me/recordings.
     try:
-        yield from _fetch_all(session, token, ZOOM_REPORT_RECORDINGS_URL, from_date, to_date)
-        return
+        return _fetch_all(session, token, ZOOM_REPORT_RECORDINGS_URL, from_date, to_date)
     except SyncError:
-        yield from _fetch_all(session, token, ZOOM_USER_RECORDINGS_URL, from_date, to_date)
+        return _fetch_all(session, token, ZOOM_USER_RECORDINGS_URL, from_date, to_date)
 
 
-def is_m4a(rf: Dict[str, Any]) -> bool:
+def encode_meeting_uuid(uuid: str) -> str:
+    # Zoom requires double-encoding when UUID contains '/'
+    return quote(quote(uuid, safe=""), safe="")
+
+
+def get_meeting_recordings(session: requests.Session, token: str, meeting_uuid: str) -> Dict[str, Any]:
+    url = ZOOM_MEETING_RECORDINGS_URL.format(meeting_uuid=encode_meeting_uuid(meeting_uuid))
+    r = session.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
+    if r.status_code != 200:
+        raise SyncError(f"Zoom meeting recordings failed ({url}): HTTP {r.status_code} - {r.text[:400]}")
+    return r.json()
+
+
+def is_m4a_file(rf: Dict[str, Any]) -> bool:
     ft = str(rf.get("file_type") or "").upper()
     fe = str(rf.get("file_extension") or "").upper()
     return ft == "M4A" or fe == "M4A"
 
 
-def recording_start_utc(rf: Dict[str, Any], meeting: Dict[str, Any]) -> Optional[datetime]:
-    return (
-        parse_zoom_dt(rf.get("recording_start"))
-        or parse_zoom_dt(rf.get("start_time"))
-        or parse_zoom_dt(meeting.get("start_time"))
-    )
-
-
-def build_remote_name(
-    rf: Dict[str, Any],
-    meeting: Dict[str, Any],
-    used_names: set[str],
-) -> str:
+def build_remote_filename(rf: Dict[str, Any]) -> str:
     name = rf.get("file_name")
     if isinstance(name, str) and name.strip().lower().endswith(".m4a"):
-        candidate = name.strip()
-    else:
-        dt = recording_start_utc(rf, meeting)
-        rid = str(rf.get("id") or "unknown")
-        if dt:
-            candidate = f"GMT{dt:%Y%m%d-%H%M%S}_Recording.m4a"
-        else:
-            candidate = f"{LEGACY_ZERO_PREFIX}{rid}.m4a"
+        return name.strip()
 
-    if candidate in used_names:
-        rid = str(rf.get("id") or "x")
-        candidate = candidate[:-4] + f"_{rid[:8]}.m4a"
+    dt = parse_zoom_dt(rf.get("recording_start") or rf.get("start_time"))
+    if dt:
+        return f"GMT{dt:%Y%m%d-%H%M%S}_Recording.m4a"
 
-    used_names.add(candidate)
-    return candidate
+    rid = str(rf.get("id") or "unknown")
+    return f"GMT00000000-000000_{rid}.m4a"
 
 
 def zoom_download(session: requests.Session, token: str, download_url: str) -> bytes:
-    r = session.get(download_url, headers={"Authorization": f"Bearer {token}"}, timeout=180)
+    r = session.get(download_url, headers={"Authorization": f"Bearer {token}"}, timeout=240)
     if r.status_code != 200:
         raise SyncError(f"Zoom download failed: HTTP {r.status_code} - {r.text[:400]}")
     return r.content
@@ -250,29 +254,30 @@ def main() -> int:
 
     now = utc_now()
     window_start = now - timedelta(minutes=env.lookback_minutes)
-
     from_date = iso_date(window_start)
     to_date = iso_date(now)
 
-    meetings = list(list_recordings(session, token, from_date, to_date))
-    print(f"[info] meetings_in_range={len(meetings)} from={from_date} to={to_date} window_start_utc={window_start.isoformat()}")
+    ia_files = ia_existing_files(env.raw_ia_identifier, session)
 
-    used_names: set[str] = set()
-    for v in uploaded.values():
-        if isinstance(v, dict) and isinstance(v.get("remote_name"), str):
-            used_names.add(v["remote_name"])
-        if isinstance(v, dict) and isinstance(v.get("legacy_remote_names"), list):
-            for n in v["legacy_remote_names"]:
-                if isinstance(n, str):
-                    used_names.add(n)
+    meetings = list_meetings(session, token, from_date, to_date)
+    print(f"[info] meetings={len(meetings)} range={from_date}..{to_date} window_start_utc={window_start.isoformat()}")
 
+    seen_m4a = 0
     uploaded_count = 0
     skipped_count = 0
-    repaired_count = 0
-    seen_m4a = 0
+    reuploaded_missing_count = 0
 
     for m in meetings:
-        files = m.get("recording_files") or []
+        meeting_uuid = m.get("uuid")
+        if not isinstance(meeting_uuid, str) or not meeting_uuid.strip():
+            continue
+
+        meeting_start = parse_zoom_dt(m.get("start_time"))
+        if meeting_start and meeting_start < window_start:
+            continue
+
+        details = get_meeting_recordings(session, token, meeting_uuid)
+        files = details.get("recording_files") or []
         if not isinstance(files, list):
             continue
 
@@ -281,7 +286,7 @@ def main() -> int:
                 continue
             if not rf.get("download_url"):
                 continue
-            if not is_m4a(rf):
+            if not is_m4a_file(rf):
                 continue
 
             seen_m4a += 1
@@ -289,68 +294,53 @@ def main() -> int:
             if not rid:
                 continue
 
-            dt = recording_start_utc(rf, m)
-            if dt and dt < window_start:
-                if env.debug:
-                    print(f"[debug] skip old rid={rid} dt={dt.isoformat()}")
+            remote_name = build_remote_filename(rf)
+
+            already = uploaded.get(rid)
+            if already:
+                prev_name = str(already.get("remote_name") or "")
+                # if IA file deleted, re-upload
+                if prev_name and prev_name not in ia_files:
+                    if env.debug:
+                        print(f"[debug] reupload missing IA file rid={rid} name={prev_name}")
+                    content = zoom_download(session, token, rf["download_url"])
+                    ia_put(session, env, env.raw_ia_identifier, prev_name, content)
+                    ia_files.add(prev_name)
+                    reuploaded_missing_count += 1
+                    uploaded_count += 1
+                else:
+                    skipped_count += 1
                 continue
 
-            entry = uploaded.get(rid)
-            if entry:
-                old_name = str(entry.get("remote_name") or "")
-                needs_repair = (
-                    env.repair_legacy_zero_names
-                    and old_name.startswith(LEGACY_ZERO_PREFIX)
-                    and not entry.get("fixed_name_uploaded")
-                )
-                if not needs_repair:
-                    skipped_count += 1
-                    continue
-
-                new_name = build_remote_name(rf, m, used_names)
-                if new_name.startswith(LEGACY_ZERO_PREFIX):
-                    skipped_count += 1
-                    continue
-
-                print(f"[info] Repair upload: {old_name} -> {new_name}")
-                content = zoom_download(session, token, rf["download_url"])
-                ia_put(session, env, env.raw_ia_identifier, new_name, content)
-
-                legacy = entry.get("legacy_remote_names")
-                if not isinstance(legacy, list):
-                    legacy = []
-                if old_name and old_name not in legacy:
-                    legacy.append(old_name)
-
-                entry["legacy_remote_names"] = legacy
-                entry["remote_name"] = new_name
-                entry["fixed_name_uploaded"] = True
-                entry["recording_start_utc"] = dt.isoformat() if dt else None
-                repaired_count += 1
-                uploaded_count += 1
+            # If state reset but file already exists on IA, just record it
+            if remote_name in ia_files:
+                uploaded[rid] = {"remote_name": remote_name, "uploaded_at_utc": now.isoformat(), "note": "found_on_ia"}
+                skipped_count += 1
                 continue
 
-            remote_name = build_remote_name(rf, m, used_names)
             if env.debug:
-                print(f"[debug] upload rid={rid} remote_name={remote_name} dt={dt.isoformat() if dt else None}")
+                print(f"[debug] upload rid={rid} remote_name={remote_name} meeting_uuid={meeting_uuid}")
 
             content = zoom_download(session, token, rf["download_url"])
-            print(f"[info] Uploading to IA RAW {env.raw_ia_identifier}/{remote_name} bytes={len(content)}")
+            print(f"[info] Uploading {env.raw_ia_identifier}/{remote_name} bytes={len(content)}")
             ia_put(session, env, env.raw_ia_identifier, remote_name, content)
+            ia_files.add(remote_name)
 
             uploaded[rid] = {
                 "remote_name": remote_name,
                 "uploaded_at_utc": now.isoformat(),
-                "meeting_id": m.get("id"),
-                "meeting_uuid": m.get("uuid"),
-                "recording_start_utc": dt.isoformat() if dt else None,
+                "meeting_uuid": meeting_uuid,
+                "recording_start_utc": (parse_zoom_dt(rf.get("recording_start")) or "").isoformat() if parse_zoom_dt(rf.get("recording_start")) else None,
             }
             uploaded_count += 1
 
     state["uploaded"] = uploaded
     safe_write_json(env.state_path, state)
 
-    print(f"[ok] SeenM4A={seen_m4a} Uploaded={uploaded_count} Repaired={repaired_count} Skipped={skipped_count} State={env.state_path}")
+    print(
+        f"[ok] SeenM4A={seen_m4a} Uploaded={uploaded_count} "
+        f"ReuploadedMissing={reuploaded_missing_count} Skipped={skipped_count} State={env.state_path}"
+    )
     return 0
 
 
