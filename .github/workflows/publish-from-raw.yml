@@ -20,11 +20,35 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+
+    env:
+      RAW_IA_IDENTIFIER: "FSPraw"
+      TARGET_IA_IDENTIFIER: "FSPneu"
+      STATE_PATH: ".publish_state.json"
+      IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+      IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Debug context (no secrets revealed)
+        run: |
+          echo "repo=${{ github.repository }}"
+          echo "event=${{ github.event_name }}"
+          echo "ref=${{ github.ref }}"
+          echo "actor=${{ github.actor }}"
+          echo "IA_ACCESS_KEY_available=${{ secrets.IA_ACCESS_KEY != '' }}"
+          echo "IA_SECRET_KEY_available=${{ secrets.IA_SECRET_KEY != '' }}"
+
+      - name: Guard - fail fast if secrets not injected
+        run: |
+          python -c "import os,sys; \
+          missing=[k for k in ['IA_ACCESS_KEY','IA_SECRET_KEY'] if not os.getenv(k)]; \
+          print('missing_env=' + ','.join(missing)); \
+          sys.exit(1 if missing else 0)"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -38,11 +62,6 @@ jobs:
 
       - name: Publish selected raw recording to FSPneu
         env:
-          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
-          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
-          RAW_IA_IDENTIFIER: "FSPraw"
-          TARGET_IA_IDENTIFIER: "FSPneu"
-          STATE_PATH: ".publish_state.json"
           LINE_FROM_DISPATCH: ${{ github.event.client_payload.line }}
         run: |
           python tools/publish_from_raw.py --line "${LINE_FROM_DISPATCH:-${{ inputs.line }}}"
