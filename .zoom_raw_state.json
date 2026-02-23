@@ -1,3 +1,22 @@
 {
-  "uploaded": {}
+  "uploaded": {
+    "78004bde-c551-416a-bfaf-40229c618928": {
+      "meeting_uuid": "5JWyqnWtSZ+VXhbFRpGa9w==",
+      "recording_start_utc": "2026-02-23T09:39:57+00:00",
+      "remote_name": "GMT20260223-093957_Recording.m4a",
+      "uploaded_at_utc": "2026-02-23T19:53:38.538002+00:00"
+    },
+    "9f4ea414-0131-48a0-8a6c-733a8ed97bcd": {
+      "meeting_uuid": "uPWhy9e1SRGQWhk0Z/HRPg==",
+      "recording_start_utc": "2026-02-23T04:46:54+00:00",
+      "remote_name": "GMT20260223-044654_Recording.m4a",
+      "uploaded_at_utc": "2026-02-23T19:53:38.538002+00:00"
+    },
+    "b452178f-b346-471c-9c5b-c213512ab6f9": {
+      "meeting_uuid": "G8crGrAwRXaXjyTPCtUC3Q==",
+      "recording_start_utc": "2026-02-23T04:44:39+00:00",
+      "remote_name": "GMT20260223-044439_Recording.m4a",
+      "uploaded_at_utc": "2026-02-23T19:53:38.538002+00:00"
+    }
+  }
 }
