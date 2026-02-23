@@ -1,22 +1,3 @@
 {
-  "uploaded": {
-    "78004bde-c551-416a-bfaf-40229c618928": {
-      "meeting_id": 3988896168,
-      "meeting_uuid": "5JWyqnWtSZ+VXhbFRpGa9w==",
-      "remote_name": "GMT00000000-000000_78004bde-c551-416a-bfaf-40229c618928.m4a",
-      "uploaded_at_utc": "2026-02-23T18:23:46.900735+00:00"
-    },
-    "9f4ea414-0131-48a0-8a6c-733a8ed97bcd": {
-      "meeting_id": 83463100254,
-      "meeting_uuid": "uPWhy9e1SRGQWhk0Z/HRPg==",
-      "remote_name": "GMT00000000-000000_9f4ea414-0131-48a0-8a6c-733a8ed97bcd.m4a",
-      "uploaded_at_utc": "2026-02-23T18:23:46.900735+00:00"
-    },
-    "b452178f-b346-471c-9c5b-c213512ab6f9": {
-      "meeting_id": 89315520002,
-      "meeting_uuid": "G8crGrAwRXaXjyTPCtUC3Q==",
-      "remote_name": "GMT00000000-000000_b452178f-b346-471c-9c5b-c213512ab6f9.m4a",
-      "uploaded_at_utc": "2026-02-23T18:23:46.900735+00:00"
-    }
-  }
+  "uploaded": {}
 }
