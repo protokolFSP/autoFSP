@@ -3,7 +3,12 @@ name: Publish from IA RAW to FSPneu
 on:
   repository_dispatch:
     types: [publish_recording]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      line:
+        description: 'Tek satır: "Title | Speaker | Assistant? | DD.MM.YYYY | Hour"'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -22,12 +27,21 @@ jobs:
       STATE_PATH: ".publish_state.json"
       IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
       IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+      LINE: ${{ github.event.client_payload.line || inputs.line }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Guard - line must be provided
+        run: |
+          if [ -z "${LINE}" ]; then
+            echo "ERROR: line is empty. Use workflow_dispatch input or repository_dispatch payload."
+            exit 2
+          fi
+          echo "OK: line_length=${#LINE}"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -40,10 +54,8 @@ jobs:
           pip install requests
 
       - name: Publish selected raw recording to FSPneu
-        env:
-          LINE_FROM_DISPATCH: ${{ github.event.client_payload.line }}
         run: |
-          python tools/publish_from_raw.py --line "${LINE_FROM_DISPATCH:-${{ inputs.line }}}"
+          python tools/publish_from_raw.py --line "${LINE}"
 
       - name: Commit publish state (if changed)
         run: |
