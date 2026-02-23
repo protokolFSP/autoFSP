@@ -145,15 +145,13 @@ def _fetch_all(session: requests.Session, token: str, base_url: str, from_date: 
 
 def list_recordings(session: requests.Session, token: str, from_date: str, to_date: str) -> Iterable[Dict[str, Any]]:
     try:
-        for m in _fetch_all(session, token, ZOOM_REPORT_RECORDINGS_URL, from_date, to_date):
-            yield m
+        yield from _fetch_all(session, token, ZOOM_REPORT_RECORDINGS_URL, from_date, to_date)
         return
     except SyncError as e:
         msg = str(e)
         if "HTTP 4" not in msg and "HTTP 5" not in msg:
             raise
-        for m in _fetch_all(session, token, ZOOM_USER_RECORDINGS_URL, from_date, to_date):
-            yield m
+        yield from _fetch_all(session, token, ZOOM_USER_RECORDINGS_URL, from_date, to_date)
 
 
 def iter_m4a_files(meeting: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
