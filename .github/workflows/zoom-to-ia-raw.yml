@@ -18,8 +18,9 @@ jobs:
 
     env:
       RAW_IA_IDENTIFIER: "FSPraw"
-      LOOKBACK_MINUTES: "90"
+      LOOKBACK_MINUTES: "1440"   # ilk test için 1 gün; sonra 90'a indir
       STATE_PATH: ".zoom_raw_state.json"
+      DEBUG: "1"                 # ilk test için; sonra 0 yap
       IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
       IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
       ZOOM_ACCOUNT_ID: ${{ secrets.ZOOM_ACCOUNT_ID }}
@@ -32,11 +33,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check secrets availability (safe)
+      - name: Install ffmpeg
         run: |
-          echo "IA_ACCESS_KEY_available=${{ secrets.IA_ACCESS_KEY != '' }}"
-          echo "IA_SECRET_KEY_available=${{ secrets.IA_SECRET_KEY != '' }}"
-          echo "ZOOM_CLIENT_ID_available=${{ secrets.ZOOM_CLIENT_ID != '' }}"    
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
 
       - name: Setup Python
         uses: actions/setup-python@v5
