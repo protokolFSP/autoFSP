@@ -1,0 +1,85 @@
+name: Process pending publish queue
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: process-pending
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+
+    env:
+      RAW_IA_IDENTIFIER: "FSPraw"
+      TARGET_IA_IDENTIFIER: "FSPneu"
+      IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+      IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Process queue
+        run: |
+          python - <<'PY'
+          import json, subprocess, sys, os
+          path = "queue/pending.json"
+          if not os.path.exists(path):
+            print("no queue file")
+            sys.exit(0)
+          data = json.load(open(path, "r", encoding="utf-8"))
+          pending = data.get("pending", [])
+          if not pending:
+            print("queue empty")
+            sys.exit(0)
+
+          keep = []
+          published = 0
+          for item in pending:
+            line = item.get("line","").strip()
+            if not line:
+              continue
+            p = subprocess.run([sys.executable, "tools/publish_from_raw.py", "--line", line])
+            if p.returncode == 0:
+              published += 1
+              continue
+            if p.returncode == 4:
+              keep.append(item)  # still waiting for RAW
+              continue
+            # hard error -> keep it, but fail the workflow
+            keep.append(item)
+            raise SystemExit(p.returncode)
+
+          data["pending"] = keep
+          json.dump(data, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2, sort_keys=True)
+          print(f"published={published} remaining={len(keep)}")
+          PY
+
+      - name: Commit queue updates (if changed)
+        run: |
+          set -e
+          if git diff --quiet -- queue/pending.json; then
+            echo "No queue updates."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add queue/pending.json
+          git commit -m "chore: process publish queue"
+          git push
