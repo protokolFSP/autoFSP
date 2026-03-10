@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 """
+tools/publish_from_raw.py
+
 Publish from IA RAW item (FSPraw) into existing target IA item (FSPneu).
 
 Input line (separator ';' or '|', spaces optional):
   Location? ; Title ; Speaker ; Assistant ; DD.MM.YYYY ; Time (HH or HH:MM)
 
-- Location optional; if present and recognized, it is placed FIRST in final filename.
-- Assistant is required in your workflow/forms (but parser tolerates it being present as 3rd field).
-- Time used ONLY for selecting RAW (Berlin); not included in filename.
-- Overwrite allowed on IA target.
+Behavior (strict):
+- RAW selection is by Berlin date and target time.
+- To prevent publishing the wrong recording when the expected RAW isn't uploaded yet,
+  selection enforces a maximum allowed time difference (in minutes).
+  If the closest candidate is farther than the limit -> exits with code 4 (NO_RAW_YET),
+  so the workflow can queue the request.
+
+Env:
+- RAW_IA_IDENTIFIER (default: FSPraw)
+- TARGET_IA_IDENTIFIER (default: FSPneu)
+- IA_ACCESS_KEY, IA_SECRET_KEY (required)
+- LOCATION_KEYWORDS (optional CSV)
+- MAX_TIME_DIFF_MINUTES (optional int, default: 30)
 
 Queue behavior:
-- If no RAW exists for that Berlin date yet -> exits with code 4 ("NO_RAW_YET").
+- If no acceptable RAW exists for that Berlin date/time yet -> exits with code 4 ("NO_RAW_YET").
 """
 
 from __future__ import annotations
@@ -44,11 +55,11 @@ DATE_RE = re.compile(r"^(?P<d>\d{1,2})\.(?P<m>\d{1,2})\.(?P<y>\d{4})$")
 
 
 class PublishError(RuntimeError):
-    pass
+    """Base error for publish pipeline."""
 
 
 class NoRawYet(PublishError):
-    """Raised when RAW isn't available yet for the requested Berlin date."""
+    """Raised when RAW isn't available yet for the requested Berlin date/time."""
 
 
 @dataclass(frozen=True)
@@ -167,14 +178,22 @@ def parse_line(line: str) -> ParsedLine:
     if not assistant:
         raise PublishError("Assistenzarzt is required.")
 
-    return ParsedLine(location=location, title=title, speaker=speaker, assistant=assistant, lesson_date=lesson_dt, hour=hour, minute=minute)
+    return ParsedLine(
+        location=location,
+        title=title,
+        speaker=speaker,
+        assistant=assistant,
+        lesson_date=lesson_dt,
+        hour=hour,
+        minute=minute,
+    )
 
 
 def sanitize_filename(s: str) -> str:
     s = s.strip()
     s = s.replace("/", "-").replace("\\", "-").replace(":", "-")
     s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"[<>\"|?*\x00-\x1f]", "", s)
+    s = re.sub(r'[<>\"|?*\x00-\x1f]', "", s)
     return s
 
 
@@ -215,18 +234,55 @@ def build_candidates(raw_identifier: str, session: requests.Session) -> List[Can
     return out
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError as e:
+        raise PublishError(f"Invalid env {name}={raw!r}, expected int") from e
+
+
+def _minutes_of_day(dt: datetime) -> int:
+    return dt.hour * 60 + dt.minute
+
+
 def select_candidate(cands: List[Candidate], target_date: date, hour: int, minute: int) -> Candidate:
+    """
+    Select the best RAW candidate for the requested Berlin date/time.
+
+    Safety:
+    - Only candidates from the same Berlin calendar date are eligible.
+    - If the closest candidate is farther than MAX_TIME_DIFF_MINUTES -> NoRawYet.
+    """
     same_day = [c for c in cands if c.berlin_dt.date() == target_date]
     if not same_day:
         raise NoRawYet(f"No RAW candidates found for {target_date.isoformat()} (Berlin date).")
 
+    max_diff = _env_int("MAX_TIME_DIFF_MINUTES", 30)
     target_minutes = hour * 60 + minute
 
-    def score(c: Candidate) -> Tuple[int, int]:
-        cand_minutes = c.berlin_dt.hour * 60 + c.berlin_dt.minute
-        return (abs(cand_minutes - target_minutes), abs(c.berlin_dt.second))
+    def diff_minutes(c: Candidate) -> int:
+        return abs(_minutes_of_day(c.berlin_dt) - target_minutes)
 
-    return sorted(same_day, key=score)[0]
+    best = min(same_day, key=diff_minutes)
+    best_diff = diff_minutes(best)
+
+    top5 = sorted(same_day, key=diff_minutes)[:5]
+    debug = [
+        {"fn": c.filename, "berlin": c.berlin_dt.strftime("%Y-%m-%d %H:%M:%S"), "diff_min": diff_minutes(c)}
+        for c in top5
+    ]
+    print(f"[debug] Candidate diffs (top {len(debug)}): {json.dumps(debug, ensure_ascii=False)}")
+
+    if best_diff > max_diff:
+        raise NoRawYet(
+            f"Closest RAW is too far from target time: diff={best_diff}min > limit={max_diff}min "
+            f"(target {hour:02d}:{minute:02d}, best {best.berlin_dt:%H:%M:%S})"
+        )
+
+    return best
 
 
 def final_filename(p: ParsedLine) -> str:
