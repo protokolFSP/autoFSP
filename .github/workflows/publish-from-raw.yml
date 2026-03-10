@@ -1,4 +1,5 @@
 name: Publish from IA RAW to FSPneu
+run-name: "Publish: ${{ github.event.client_payload.line || inputs.line }}"
 
 on:
   repository_dispatch:
@@ -45,7 +46,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Prefer repository_dispatch payload, fallback to workflow_dispatch input
           LINE_FROM_PAYLOAD='${{ github.event.client_payload.line }}'
           LINE_FROM_INPUT='${{ inputs.line }}'
 
@@ -63,12 +63,15 @@ jobs:
           echo "Resolved LINE=${LINE}"
 
       - name: Publish or queue
+        id: publish
         shell: bash
         run: |
           set +e
-          python tools/publish_from_raw.py --line "${LINE}"
-          code=$?
+          python tools/publish_from_raw.py --line "${LINE}" | tee .publish_output.txt
+          code=${PIPESTATUS[0]}
           set -e
+
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
 
           if [ "$code" -eq 4 ]; then
             echo "RAW not yet available -> queueing request"
@@ -76,6 +79,31 @@ jobs:
           elif [ "$code" -ne 0 ]; then
             exit "$code"
           fi
+
+      - name: Summary
+        if: ${{ steps.publish.outputs.exit_code == '0' || steps.publish.outputs.exit_code == '4' }}
+        shell: bash
+        run: |
+          code="${{ steps.publish.outputs.exit_code }}"
+          {
+            echo "### Publish summary"
+            echo ""
+            echo "- LINE: \`${LINE}\`"
+            if [ "${code}" = "0" ]; then
+              echo "- Result: ✅ published"
+            else
+              echo "- Result: ⏳ queued (RAW not yet available)"
+            fi
+            echo ""
+            echo "#### Script output (last 200 lines)"
+            echo "\`\`\`"
+            if [ -s .publish_output.txt ]; then
+              tail -n 200 .publish_output.txt
+            else
+              echo "(no script output)"
+            fi
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Commit queue changes (if any)
         shell: bash
