@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       line:
+        description: "Exact line identifier (must match RAW exactly)"
         required: true
         type: string
 
@@ -25,7 +26,6 @@ jobs:
       TARGET_IA_IDENTIFIER: "FSPneu"
       IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
       IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
-      LINE: ${{ github.event.client_payload.line || inputs.line }}
 
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +40,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
+      - name: Resolve LINE
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Prefer repository_dispatch payload, fallback to workflow_dispatch input
+          LINE_FROM_PAYLOAD='${{ github.event.client_payload.line }}'
+          LINE_FROM_INPUT='${{ inputs.line }}'
+
+          LINE="$LINE_FROM_PAYLOAD"
+          if [ -z "${LINE}" ]; then
+            LINE="$LINE_FROM_INPUT"
+          fi
+
+          if [ -z "${LINE}" ]; then
+            echo "LINE is missing. Provide client_payload.line for repository_dispatch or inputs.line for workflow_dispatch."
+            exit 2
+          fi
+
+          echo "LINE=${LINE}" >> "$GITHUB_ENV"
+          echo "Resolved LINE=${LINE}"
+
       - name: Publish or queue
+        shell: bash
         run: |
           set +e
           python tools/publish_from_raw.py --line "${LINE}"
@@ -55,8 +78,9 @@ jobs:
           fi
 
       - name: Commit queue changes (if any)
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           if git diff --quiet -- queue/pending.json; then
             echo "No queue changes."
             exit 0
