@@ -1,3 +1,4 @@
+# .github/workflows/process-pending.yml
 name: Process pending publish queue
 
 on:
@@ -8,8 +9,9 @@ on:
 permissions:
   contents: write
 
+# IMPORTANT: queue/pending.json'a yazan TÜM workflow'larda aynı group'u kullan.
 concurrency:
-  group: process-pending
+  group: publish-queue
   cancel-in-progress: false
 
 jobs:
@@ -31,55 +33,147 @@ jobs:
         with:
           python-version: "3.11"
 
-      - run: |
+      - name: Install deps
+        run: |
           python -m pip install --upgrade pip
           pip install requests
 
       - name: Process queue
+        shell: bash
         run: |
+          set -euo pipefail
           python - <<'PY'
-          import json, subprocess, sys, os
-          path = "queue/pending.json"
-          if not os.path.exists(path):
-            print("no queue file")
-            sys.exit(0)
-          data = json.load(open(path, "r", encoding="utf-8"))
-          pending = data.get("pending", [])
-          if not pending:
-            print("queue empty")
-            sys.exit(0)
+          """
+          Processes queue/pending.json:
+            - rc=0: remove item from queue
+            - rc=4: keep waiting
+            - else: keep item, but fail job after persisting updated queue
+          """
+          from __future__ import annotations
 
-          keep = []
-          published = 0
-          for item in pending:
-            line = item.get("line","").strip()
-            if not line:
-              continue
+          import json
+          import os
+          import subprocess
+          import sys
+          from dataclasses import dataclass
+          from typing import Any, Dict, List, Optional
+
+
+          PATH = "queue/pending.json"
+          MAX_PER_RUN = int(os.environ.get("QUEUE_MAX_PER_RUN", "0"))  # 0 => no limit
+
+
+          @dataclass
+          class Result:
+            published: int
+            remaining: int
+            first_hard_error: Optional[int]
+
+
+          def load_queue(path: str) -> Dict[str, Any]:
+            if not os.path.exists(path):
+              return {"pending": []}
+            with open(path, "r", encoding="utf-8") as f:
+              data = json.load(f)
+            if not isinstance(data, dict):
+              return {"pending": []}
+            pending = data.get("pending", [])
+            if not isinstance(pending, list):
+              pending = []
+            data["pending"] = pending
+            return data
+
+
+          def save_queue(path: str, data: Dict[str, Any]) -> None:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+              f.write("\n")
+
+
+          def run_publish(line: str) -> int:
             p = subprocess.run([sys.executable, "tools/publish_from_raw.py", "--line", line])
-            if p.returncode == 0:
-              published += 1
-              continue
-            if p.returncode == 4:
-              keep.append(item)  # still waiting for RAW
-              continue
-            # hard error -> keep it, but fail the workflow
-            keep.append(item)
-            raise SystemExit(p.returncode)
+            return int(p.returncode)
 
-          data["pending"] = keep
-          json.dump(data, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2, sort_keys=True)
-          print(f"published={published} remaining={len(keep)}")
+
+          def process(data: Dict[str, Any]) -> Result:
+            pending: List[Dict[str, Any]] = list(data.get("pending", []))
+            if not pending:
+              print("queue empty")
+              return Result(published=0, remaining=0, first_hard_error=None)
+
+            keep: List[Dict[str, Any]] = []
+            published = 0
+            first_hard_error: Optional[int] = None
+            processed = 0
+
+            for item in pending:
+              if MAX_PER_RUN and processed >= MAX_PER_RUN:
+                keep.append(item)
+                continue
+
+              if not isinstance(item, dict):
+                continue
+
+              line = str(item.get("line", "")).strip()
+              if not line:
+                continue
+
+              rc = run_publish(line)
+              processed += 1
+
+              if rc == 0:
+                published += 1
+                continue
+              if rc == 4:
+                keep.append(item)
+                continue
+
+              # hard error
+              keep.append(item)
+              if first_hard_error is None:
+                first_hard_error = rc
+
+            data["pending"] = keep
+            print(f"published={published} remaining={len(keep)} processed={processed} hard_error={first_hard_error}")
+            return Result(published=published, remaining=len(keep), first_hard_error=first_hard_error)
+
+
+          def main() -> int:
+            data = load_queue(PATH)
+            res = process(data)
+            # Always persist progress (even if there was a hard error)
+            save_queue(PATH, data)
+            return res.first_hard_error or 0
+
+
+          raise SystemExit(main())
           PY
 
       - name: Commit queue updates (if changed)
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           if git diff --quiet -- queue/pending.json; then
             echo "No queue updates."
             exit 0
           fi
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git add queue/pending.json
           git commit -m "chore: process publish queue"
-          git push
+
+          # Rebase+retry to survive concurrent updates
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Pushed successfully."
+              exit 0
+            fi
+            echo "Push failed (attempt ${attempt}) -> pull --rebase and retry..."
+            git pull --rebase
+          done
+
+          echo "Failed to push after retries."
+          exit 1
