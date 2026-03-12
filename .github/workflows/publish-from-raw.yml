@@ -1,3 +1,4 @@
+# .github/workflows/publish-from-raw.yml
 name: Publish from IA RAW to FSPneu
 run-name: "Publish: ${{ github.event.client_payload.line || inputs.line }}"
 
@@ -21,7 +22,6 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-
     env:
       RAW_IA_IDENTIFIER: "FSPraw"
       TARGET_IA_IDENTIFIER: "FSPneu"
@@ -37,7 +37,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - run: |
+      - name: Install deps
+        run: |
           python -m pip install --upgrade pip
           pip install requests
 
@@ -46,13 +47,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          LINE_FROM_PAYLOAD='${{ github.event.client_payload.line }}'
-          LINE_FROM_INPUT='${{ inputs.line }}'
-
-          LINE="$LINE_FROM_PAYLOAD"
-          if [ -z "${LINE}" ]; then
-            LINE="$LINE_FROM_INPUT"
-          fi
+          # Prefer repository_dispatch payload, fallback to workflow_dispatch input
+          LINE="${{ github.event.client_payload.line || inputs.line }}"
 
           if [ -z "${LINE}" ]; then
             echo "LINE is missing. Provide client_payload.line for repository_dispatch or inputs.line for workflow_dispatch."
@@ -68,22 +64,23 @@ jobs:
         run: |
           set +e
           python tools/publish_from_raw.py --line "${LINE}" | tee .publish_output.txt
-          code=${PIPESTATUS[0]}
+          code="${PIPESTATUS[0]}"
           set -e
 
-          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
 
-          if [ "$code" -eq 4 ]; then
+          if [ "${code}" -eq 4 ]; then
             echo "RAW not yet available -> queueing request"
             python tools/enqueue_pending.py --line "${LINE}"
-          elif [ "$code" -ne 0 ]; then
-            exit "$code"
+          elif [ "${code}" -ne 0 ]; then
+            exit "${code}"
           fi
 
       - name: Summary
-        if: ${{ steps.publish.outputs.exit_code == '0' || steps.publish.outputs.exit_code == '4' }}
+        if: ${{ always() && (steps.publish.outputs.exit_code == '0' || steps.publish.outputs.exit_code == '4') }}
         shell: bash
         run: |
+          set -euo pipefail
           code="${{ steps.publish.outputs.exit_code }}"
           {
             echo "### Publish summary"
@@ -109,12 +106,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           if git diff --quiet -- queue/pending.json; then
             echo "No queue changes."
             exit 0
           fi
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git add queue/pending.json
           git commit -m "chore: queue publish request"
-          git push
+
+          # Push with simple rebase/retry to survive concurrent updates.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Pushed successfully."
+              exit 0
+            fi
+            echo "Push failed (attempt ${attempt}) -> pulling/rebasing and retrying..."
+            git pull --rebase
+          done
+
+          echo "Failed to push after retries."
+          exit 1
