@@ -27,6 +27,7 @@ jobs:
       TARGET_IA_IDENTIFIER: "FSPneu"
       IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
       IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+      LINE: ${{ github.event.client_payload.line || inputs.line }}
 
     steps:
       - uses: actions/checkout@v4
@@ -42,26 +43,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Resolve LINE
+      - name: Validate LINE
         shell: bash
         run: |
           set -euo pipefail
-
-          # Prefer repository_dispatch payload, fallback to workflow_dispatch input
-          LINE="${{ github.event.client_payload.line || inputs.line }}"
-
           if [ -z "${LINE}" ]; then
             echo "LINE is missing. Provide client_payload.line for repository_dispatch or inputs.line for workflow_dispatch."
             exit 2
           fi
-
-          echo "LINE=${LINE}" >> "$GITHUB_ENV"
           echo "Resolved LINE=${LINE}"
 
       - name: Publish or queue
         id: publish
         shell: bash
         run: |
+          set -euo pipefail
+
+          # Capture exit code while still tee'ing output.
           set +e
           python tools/publish_from_raw.py --line "${LINE}" | tee .publish_output.txt
           code="${PIPESTATUS[0]}"
@@ -103,11 +101,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Commit queue changes (if any)
+        if: ${{ steps.publish.outputs.exit_code == '4' }}
         shell: bash
         run: |
           set -euo pipefail
 
-          if git diff --quiet -- queue/pending.json; then
+          # Only proceed if enqueue actually changed the repo.
+          if git diff --quiet -- queue/pending.json 2>/dev/null; then
             echo "No queue changes."
             exit 0
           fi
@@ -118,14 +118,14 @@ jobs:
           git add queue/pending.json
           git commit -m "chore: queue publish request"
 
-          # Push with simple rebase/retry to survive concurrent updates.
+          # Push with rebase retries; autostash prevents failure if the rebase needs a clean index.
           for attempt in 1 2 3 4 5; do
             if git push; then
               echo "Pushed successfully."
               exit 0
             fi
             echo "Push failed (attempt ${attempt}) -> pulling/rebasing and retrying..."
-            git pull --rebase
+            git pull --rebase --autostash
           done
 
           echo "Failed to push after retries."
