@@ -46,15 +46,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          # Prefer repository_dispatch payload, fallback to workflow_dispatch input
           LINE="${{ github.event.client_payload.line || inputs.line }}"
-
           if [ -z "${LINE}" ]; then
             echo "LINE is missing. Provide client_payload.line for repository_dispatch or inputs.line for workflow_dispatch."
             exit 2
           fi
-
           echo "LINE=${LINE}" >> "$GITHUB_ENV"
           echo "Resolved LINE=${LINE}"
 
@@ -68,6 +64,7 @@ jobs:
           set -e
 
           echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
+          echo "publish_exit_code=${code}"
 
           if [ "${code}" -eq 4 ]; then
             echo "RAW not yet available -> queueing request"
@@ -75,6 +72,56 @@ jobs:
           elif [ "${code}" -ne 0 ]; then
             exit "${code}"
           fi
+
+      - name: Upload publish output artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: publish_output
+          path: .publish_output.txt
+
+      - name: Verify published file exists on FSPneu (metadata check)
+        if: ${{ steps.publish.outputs.exit_code == '0' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import json, re, sys, time
+          import requests
+
+          ident = "FSPneu"
+
+          txt = open(".publish_output.txt", "r", encoding="utf-8", errors="ignore").read()
+          candidates = re.findall(r"\{.*\}", txt)
+          final_name = None
+          for c in reversed(candidates):
+            try:
+              obj = json.loads(c)
+            except Exception:
+              continue
+            if isinstance(obj, dict) and obj.get("final_filename"):
+              final_name = obj["final_filename"]
+              break
+
+          if not final_name:
+            print("ERROR: Could not find final_filename in .publish_output.txt")
+            sys.exit(1)
+
+          url = f"https://archive.org/metadata/{ident}"
+
+          for i in range(1, 7):
+            meta = requests.get(url, timeout=30).json()
+            files = meta.get("files", [])
+            names = {f.get("name") for f in files if isinstance(f, dict)}
+            if final_name in names:
+              print("OK: File present on metadata:", final_name)
+              sys.exit(0)
+            print(f"Not listed yet (attempt {i}/6) -> sleeping 10s")
+            time.sleep(10)
+
+          print("ERROR: exit_code=0 but file not present on metadata after retries:", final_name)
+          sys.exit(1)
+          PY
 
       - name: Summary
         if: ${{ always() && (steps.publish.outputs.exit_code == '0' || steps.publish.outputs.exit_code == '4') }}
@@ -107,7 +154,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          if git diff --quiet -- queue/pending.json; then
+          # Commit anything under queue/ (not only queue/pending.json)
+          if git diff --quiet -- queue/; then
             echo "No queue changes."
             exit 0
           fi
@@ -115,10 +163,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add queue/pending.json
+          git add queue/
           git commit -m "chore: queue publish request"
 
-          # Push with simple rebase/retry to survive concurrent updates.
           for attempt in 1 2 3 4 5; do
             if git push; then
               echo "Pushed successfully."
