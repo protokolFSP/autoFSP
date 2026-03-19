@@ -59,7 +59,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          python tools/publish_from_raw.py --line "${LINE}" | tee .publish_output.txt
+ 
           code="${PIPESTATUS[0]}"
           set -e
 
