@@ -24,8 +24,8 @@ Env:
 Queue behavior:
 - If no acceptable RAW exists for that Berlin date/time yet -> exits with code 4 ("NO_RAW_YET").
 
-Verification behavior (added):
-- After upload succeeds (HTTP 200/201), poll IA metadata until the file appears (sleep).
+Verification behavior:
+- After upload succeeds (HTTP 200/201), poll IA metadata until the file appears (backoff).
 """
 
 from __future__ import annotations
@@ -38,9 +38,9 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
@@ -48,6 +48,7 @@ try:
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
+
 
 IA_META_BASE = "https://archive.org/metadata"
 IA_DOWNLOAD_BASE = "https://archive.org/download"
@@ -92,20 +93,14 @@ def _require_env(name: str) -> str:
     return v
 
 
-def _safe_write_json(path: str, data: Dict[str, Any]) -> None:
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp, path)
-
-
-def _load_json(path: str, default: Dict[str, Any]) -> Dict[str, Any]:
-    if not os.path.exists(path):
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
         return default
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return data if isinstance(data, dict) else default
+    try:
+        return int(raw.strip())
+    except ValueError as e:
+        raise PublishError(f"Invalid env {name}={raw!r}, expected int") from e
 
 
 def _norm_loc(s: str) -> str:
@@ -196,9 +191,10 @@ def parse_line(line: str) -> ParsedLine:
 
 def sanitize_filename(s: str) -> str:
     """
-    UPDATED:
-    - Makes filename ASCII-safe (avoids IA/UI encoding weirdness)
-    - Keeps only [A-Za-z0-9 ._-]
+    Make filename ASCII-safe for IA:
+    - Transliterate common chars
+    - Drop diacritics
+    - Keep only [A-Za-z0-9 ._-]
     """
     s = s.strip()
 
@@ -241,11 +237,57 @@ def parse_raw_gmt_filename(fn: str) -> Optional[datetime]:
     return datetime.strptime(m.group("ymd") + m.group("hms"), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
 
 
+def _request_with_retries(
+    session: requests.Session,
+    method: str,
+    url: str,
+    *,
+    timeout: int,
+    max_attempts: int = 4,
+    base_sleep_s: float = 1.0,
+    **kwargs: Any,
+) -> requests.Response:
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return session.request(method, url, timeout=timeout, **kwargs)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_exc = e
+            sleep_s = base_sleep_s * (2 ** (attempt - 1))
+            print(f"[net] {method} failed (attempt {attempt}/{max_attempts}) -> {e} -> sleep {sleep_s:.1f}s")
+            time.sleep(sleep_s)
+    raise PublishError(f"Network failure calling {method} {url}: {last_exc}") from last_exc
+
+
 def ia_metadata(identifier: str, session: requests.Session) -> Dict[str, Any]:
-    r = session.get(f"{IA_META_BASE}/{identifier}", timeout=60)
+    r = _request_with_retries(session, "GET", f"{IA_META_BASE}/{identifier}", timeout=60)
     if r.status_code != 200:
         raise PublishError(f"IA metadata fetch failed for {identifier}: HTTP {r.status_code} - {r.text[:300]}")
-    return r.json()
+    data = r.json()
+    if not isinstance(data, dict):
+        raise PublishError(f"IA metadata invalid JSON for {identifier} (expected dict).")
+    return data
+
+
+def _iter_file_dicts(files: Any) -> Iterable[Dict[str, Any]]:
+    """
+    IA metadata can return:
+    - files: [ {name: ...}, ... ]
+    - files: { "filename.ext": { ... }, ... }
+    """
+    if isinstance(files, list):
+        for f in files:
+            if isinstance(f, dict):
+                yield f
+        return
+
+    if isinstance(files, dict):
+        for name, meta in files.items():
+            if isinstance(meta, dict):
+                d = dict(meta)
+                d.setdefault("name", name)
+                yield d
+        return
 
 
 def build_candidates(raw_identifier: str, session: requests.Session) -> List[Candidate]:
@@ -253,36 +295,18 @@ def build_candidates(raw_identifier: str, session: requests.Session) -> List[Can
         raise PublishError("zoneinfo not available (unexpected on GitHub Actions).")
 
     meta = ia_metadata(raw_identifier, session)
-    files = meta.get("files") or []
     berlin = ZoneInfo("Europe/Berlin")
 
     out: List[Candidate] = []
-    if isinstance(files, list):
-        for f in files:
-            if not isinstance(f, dict):
-                continue
-            name = f.get("name")
-            if not isinstance(name, str) or not name.lower().endswith(".m4a"):
-                continue
-            utc_dt = parse_raw_gmt_filename(name)
-            if not utc_dt:
-                continue
-            out.append(Candidate(filename=name, utc_dt=utc_dt, berlin_dt=utc_dt.astimezone(berlin)))
+    for f in _iter_file_dicts(meta.get("files")):
+        name = f.get("name")
+        if not isinstance(name, str) or not name.lower().endswith(".m4a"):
+            continue
+        utc_dt = parse_raw_gmt_filename(name)
+        if not utc_dt:
+            continue
+        out.append(Candidate(filename=name, utc_dt=utc_dt, berlin_dt=utc_dt.astimezone(berlin)))
     return out
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return int(raw.strip())
-    except ValueError as e:
-        raise PublishError(f"Invalid env {name}={raw!r}, expected int") from e
-
-
-def _minutes_of_day(dt: datetime) -> int:
-    return dt.hour * 60 + dt.minute
 
 
 def select_candidate(cands: List[Candidate], target_date: date, hour: int, minute: int) -> Candidate:
@@ -293,15 +317,20 @@ def select_candidate(cands: List[Candidate], target_date: date, hour: int, minut
     - Only candidates from the same Berlin calendar date are eligible.
     - If the closest candidate is farther than MAX_TIME_DIFF_MINUTES -> NoRawYet.
     """
+    if ZoneInfo is None:
+        raise PublishError("zoneinfo not available (unexpected on GitHub Actions).")
+
+    berlin = ZoneInfo("Europe/Berlin")
+    target_dt = datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=berlin)
+
     same_day = [c for c in cands if c.berlin_dt.date() == target_date]
     if not same_day:
         raise NoRawYet(f"No RAW candidates found for {target_date.isoformat()} (Berlin date).")
 
     max_diff = _env_int("MAX_TIME_DIFF_MINUTES", 30)
-    target_minutes = hour * 60 + minute
 
     def diff_minutes(c: Candidate) -> int:
-        return abs(_minutes_of_day(c.berlin_dt) - target_minutes)
+        return int(abs((c.berlin_dt - target_dt).total_seconds()) // 60)
 
     best = min(same_day, key=diff_minutes)
     best_diff = diff_minutes(best)
@@ -333,7 +362,7 @@ def final_filename(p: ParsedLine) -> str:
 
 def download_raw_to_file(raw_identifier: str, filename: str, session: requests.Session) -> str:
     url = f"{IA_DOWNLOAD_BASE}/{raw_identifier}/{filename}"
-    r = session.get(url, timeout=240, stream=True)
+    r = _request_with_retries(session, "GET", url, timeout=240, stream=True)
     if r.status_code != 200:
         raise PublishError(f"RAW download failed: HTTP {r.status_code} - {r.text[:300]}")
     tmp = NamedTemporaryFile(delete=False, suffix=".m4a")
@@ -366,7 +395,7 @@ def ia_put_with_metadata(
         headers[f"x-archive-meta-{k}"] = v
 
     with open(file_path, "rb") as f:
-        r = session.put(url, data=f, headers=headers, timeout=600)
+        r = _request_with_retries(session, "PUT", url, timeout=600, data=f, headers=headers)
 
     print(f"[upload] PUT {identifier}/{filename} -> HTTP {r.status_code}")
     if r.status_code not in (200, 201):
@@ -377,26 +406,30 @@ def wait_until_file_listed(
     session: requests.Session,
     identifier: str,
     filename: str,
-    attempts: int = 6,
-    sleep_s: int = 10,
+    attempts: int = 7,
+    sleep_s: int = 5,
+    max_sleep_s: int = 30,
 ) -> None:
     """
-    ADDED:
     Poll IA metadata and wait until uploaded file is visible (indexing delay).
+    Uses exponential backoff capped by max_sleep_s.
     """
+    cur_sleep = sleep_s
     for i in range(1, attempts + 1):
         meta = ia_metadata(identifier, session)
-        files = meta.get("files") or []
-        names = set()
-        if isinstance(files, list):
-            for f in files:
-                if isinstance(f, dict) and isinstance(f.get("name"), str):
-                    names.add(f["name"])
+        names: set[str] = set()
+        for f in _iter_file_dicts(meta.get("files")):
+            name = f.get("name")
+            if isinstance(name, str):
+                names.add(name)
+
         if filename in names:
             print(f"[verify] Listed on metadata: {identifier}/{filename}")
             return
-        print(f"[verify] Not listed yet (attempt {i}/{attempts}) -> sleeping {sleep_s}s")
-        time.sleep(sleep_s)
+
+        print(f"[verify] Not listed yet (attempt {i}/{attempts}) -> sleeping {cur_sleep}s")
+        time.sleep(cur_sleep)
+        cur_sleep = min(max_sleep_s, cur_sleep * 2)
 
     raise PublishError(f"Upload completed but file not visible in metadata yet: {identifier}/{filename}")
 
@@ -415,37 +448,44 @@ def main() -> int:
     p = parse_line(args.line)
 
     session = requests.Session()
-    candidates = build_candidates(raw_identifier, session)
-    chosen = select_candidate(candidates, p.lesson_date, p.hour, p.minute)
+    tmp_path: Optional[str] = None
+    try:
+        candidates = build_candidates(raw_identifier, session)
+        chosen = select_candidate(candidates, p.lesson_date, p.hour, p.minute)
+        print(f"[info] Selected RAW={chosen.filename} Berlin={chosen.berlin_dt:%Y-%m-%d %H:%M:%S}")
 
-    print(f"[info] Selected RAW={chosen.filename} Berlin={chosen.berlin_dt:%Y-%m-%d %H:%M:%S}")
+        out_name = final_filename(p)
+        tmp_path = download_raw_to_file(raw_identifier, chosen.filename, session)
 
-    out_name = final_filename(p)
-    tmp_path = download_raw_to_file(raw_identifier, chosen.filename, session)
+        meta = {
+            "mediatype": "audio",
+            "title": "FSPneu Upload",
+            "language": "deu",
+            "creator": "ProtokolFSP",
+            "date": p.lesson_date.isoformat(),
+        }
 
-    meta = {
-        "mediatype": "audio",
-        "title": "FSPneu Upload",
-        "language": "deu",
-        "creator": "ProtokolFSP",
-        "date": p.lesson_date.isoformat(),
-    }
+        ia_put_with_metadata(
+            session=session,
+            ia_access_key=ia_access_key,
+            ia_secret_key=ia_secret_key,
+            identifier=target_identifier,
+            filename=out_name,
+            file_path=tmp_path,
+            metadata=meta,
+        )
 
-    ia_put_with_metadata(
-        session=session,
-        ia_access_key=ia_access_key,
-        ia_secret_key=ia_secret_key,
-        identifier=target_identifier,
-        filename=out_name,
-        file_path=tmp_path,
-        metadata=meta,
-    )
+        wait_until_file_listed(session, target_identifier, out_name, attempts=7, sleep_s=5, max_sleep_s=30)
 
-    # ADDED: verify listing with sleep/poll
-    wait_until_file_listed(session, target_identifier, out_name, attempts=6, sleep_s=10)
-
-    print(json.dumps({"ok": True, "final_filename": out_name, "raw_filename": chosen.filename}, ensure_ascii=False))
-    return 0
+        print(json.dumps({"ok": True, "final_filename": out_name, "raw_filename": chosen.filename}, ensure_ascii=False))
+        return 0
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        session.close()
 
 
 if __name__ == "__main__":
