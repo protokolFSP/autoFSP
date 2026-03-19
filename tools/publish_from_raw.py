@@ -23,6 +23,9 @@ Env:
 
 Queue behavior:
 - If no acceptable RAW exists for that Berlin date/time yet -> exits with code 4 ("NO_RAW_YET").
+
+Verification behavior (added):
+- After upload succeeds (HTTP 200/201), poll IA metadata until the file appears (sleep).
 """
 
 from __future__ import annotations
@@ -32,6 +35,8 @@ import json
 import os
 import re
 import sys
+import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from tempfile import NamedTemporaryFile
@@ -190,11 +195,43 @@ def parse_line(line: str) -> ParsedLine:
 
 
 def sanitize_filename(s: str) -> str:
+    """
+    UPDATED:
+    - Makes filename ASCII-safe (avoids IA/UI encoding weirdness)
+    - Keeps only [A-Za-z0-9 ._-]
+    """
     s = s.strip()
+
+    table = str.maketrans(
+        {
+            "ü": "ue",
+            "Ü": "Ue",
+            "ö": "oe",
+            "Ö": "Oe",
+            "ä": "ae",
+            "Ä": "Ae",
+            "ß": "ss",
+            "ı": "i",
+            "İ": "I",
+            "ş": "s",
+            "Ş": "S",
+            "ğ": "g",
+            "Ğ": "G",
+            "ç": "c",
+            "Ç": "C",
+        }
+    )
+    s = s.translate(table)
+
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+
     s = s.replace("/", "-").replace("\\", "-").replace(":", "-")
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r'[<>\"|?*\x00-\x1f]', "", s)
-    return s
+
+    s = re.sub(r"[^A-Za-z0-9 ._\-]", "", s).strip()
+    return s or "recording"
 
 
 def parse_raw_gmt_filename(fn: str) -> Optional[datetime]:
@@ -330,8 +367,38 @@ def ia_put_with_metadata(
 
     with open(file_path, "rb") as f:
         r = session.put(url, data=f, headers=headers, timeout=600)
+
+    print(f"[upload] PUT {identifier}/{filename} -> HTTP {r.status_code}")
     if r.status_code not in (200, 201):
         raise PublishError(f"IA upload failed for {identifier}/{filename}: HTTP {r.status_code} - {r.text[:400]}")
+
+
+def wait_until_file_listed(
+    session: requests.Session,
+    identifier: str,
+    filename: str,
+    attempts: int = 6,
+    sleep_s: int = 10,
+) -> None:
+    """
+    ADDED:
+    Poll IA metadata and wait until uploaded file is visible (indexing delay).
+    """
+    for i in range(1, attempts + 1):
+        meta = ia_metadata(identifier, session)
+        files = meta.get("files") or []
+        names = set()
+        if isinstance(files, list):
+            for f in files:
+                if isinstance(f, dict) and isinstance(f.get("name"), str):
+                    names.add(f["name"])
+        if filename in names:
+            print(f"[verify] Listed on metadata: {identifier}/{filename}")
+            return
+        print(f"[verify] Not listed yet (attempt {i}/{attempts}) -> sleeping {sleep_s}s")
+        time.sleep(sleep_s)
+
+    raise PublishError(f"Upload completed but file not visible in metadata yet: {identifier}/{filename}")
 
 
 def main() -> int:
@@ -373,6 +440,9 @@ def main() -> int:
         file_path=tmp_path,
         metadata=meta,
     )
+
+    # ADDED: verify listing with sleep/poll
+    wait_until_file_listed(session, target_identifier, out_name, attempts=6, sleep_s=10)
 
     print(json.dumps({"ok": True, "final_filename": out_name, "raw_filename": chosen.filename}, ensure_ascii=False))
     return 0
