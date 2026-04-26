@@ -55,14 +55,6 @@
     {
       "line": "ACS; Dr Mustafa ; Fr Gerhild; 22.04.2026; 20:05",
       "queued_at_utc": "2026-04-25T06:35:43.376665+00:00"
-    },
-    {
-      "line": "Interkostalneuralgie; Dr. Murat; Dr. Ferhat; 26.04.2026; 12:50",
-      "queued_at_utc": "2026-04-26T11:43:42.962981+00:00"
-    },
-    {
-      "line": "Schlafapnoe-Syndrom; Dr. Murat; Dr Altun; 26.04.2026; 12:10",
-      "queued_at_utc": "2026-04-26T11:43:55.559850+00:00"
     }
   ]
 }
