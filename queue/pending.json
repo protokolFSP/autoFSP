@@ -55,14 +55,6 @@
     {
       "line": "ACS; Dr Mustafa ; Fr Gerhild; 22.04.2026; 20:05",
       "queued_at_utc": "2026-04-25T06:35:43.376665+00:00"
-    },
-    {
-      "line": "Apoplex; Dr.Ömer; Mustafa A; 03.05.2026; 21:00",
-      "queued_at_utc": "2026-05-03T20:25:32.832098+00:00"
-    },
-    {
-      "line": "Apoplex; Dr.Ömer; Dr Mustafa A; 03.05.2026; 21:00",
-      "queued_at_utc": "2026-05-03T21:56:10.940376+00:00"
     }
   ]
 }
