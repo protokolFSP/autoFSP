@@ -9,7 +9,6 @@ on:
 permissions:
   contents: write
 
-# IMPORTANT: queue/pending.json'a yazan TÜM workflow'larda aynı group'u kullan.
 concurrency:
   group: publish-queue
   cancel-in-progress: false
@@ -28,6 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.ref_name }}
 
       - uses: actions/setup-python@v5
         with:
@@ -39,15 +39,17 @@ jobs:
           pip install requests
 
       - name: Process queue
+        id: process_queue
         shell: bash
         run: |
           set -euo pipefail
+          set +e
           python - <<'PY'
           """
           Processes queue/pending.json:
             - rc=0: remove item from queue
             - rc=4: keep waiting
-            - else: keep item, but fail job after persisting updated queue
+            - else: keep item, but report hard error after persisting updated queue
           """
           from __future__ import annotations
 
@@ -87,7 +89,7 @@ jobs:
           def save_queue(path: str, data: Dict[str, Any]) -> None:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
-              json.dump(data, f, ensure_ascii=False, indent=2)
+              json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
               f.write("\n")
 
 
@@ -125,11 +127,11 @@ jobs:
               if rc == 0:
                 published += 1
                 continue
+
               if rc == 4:
                 keep.append(item)
                 continue
 
-              # hard error
               keep.append(item)
               if first_hard_error is None:
                 first_hard_error = rc
@@ -142,19 +144,25 @@ jobs:
           def main() -> int:
             data = load_queue(PATH)
             res = process(data)
-            # Always persist progress (even if there was a hard error)
             save_queue(PATH, data)
             return res.first_hard_error or 0
 
 
           raise SystemExit(main())
           PY
+          code=$?
+          set -e
+
+          echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Commit queue updates (if changed)
+        if: ${{ always() }}
         shell: bash
         run: |
           set -euo pipefail
-          if git diff --quiet -- queue/pending.json; then
+
+          if git diff --quiet -- queue/pending.json 2>/dev/null; then
             echo "No queue updates."
             exit 0
           fi
@@ -165,15 +173,22 @@ jobs:
           git add queue/pending.json
           git commit -m "chore: process publish queue"
 
-          # Rebase+retry to survive concurrent updates
           for attempt in 1 2 3 4 5; do
-            if git push; then
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
               echo "Pushed successfully."
               exit 0
             fi
-            echo "Push failed (attempt ${attempt}) -> pull --rebase and retry..."
-            git pull --rebase
+            echo "Push failed (attempt ${attempt}) -> fetching/rebasing and retrying..."
+            git fetch origin "${GITHUB_REF_NAME}"
+            git rebase "origin/${GITHUB_REF_NAME}"
           done
 
           echo "Failed to push after retries."
+          exit 1
+
+      - name: Fail on hard publish error
+        if: ${{ always() && steps.process_queue.outputs.exit_code != '0' }}
+        shell: bash
+        run: |
+          echo "Queue processing had hard error: ${{ steps.process_queue.outputs.exit_code }}"
           exit 1
