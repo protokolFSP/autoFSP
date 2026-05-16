@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+import traceback
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from tempfile import NamedTemporaryFile
@@ -208,7 +209,10 @@ def ia_metadata(identifier: str, session: requests.Session) -> Dict[str, Any]:
     r = session.get(f"{IA_META_BASE}/{identifier}", timeout=60)
     if r.status_code != 200:
         raise PublishError(f"IA metadata fetch failed for {identifier}: HTTP {r.status_code} - {r.text[:300]}")
-    return r.json()
+    try:
+        return r.json()
+    except ValueError as e:
+        raise PublishError(f"IA metadata returned invalid JSON for {identifier}") from e
 
 
 def build_candidates(raw_identifier: str, session: requests.Session) -> List[Candidate]:
@@ -347,32 +351,36 @@ def main() -> int:
 
     p = parse_line(args.line)
 
-    session = requests.Session()
-    candidates = build_candidates(raw_identifier, session)
-    chosen = select_candidate(candidates, p.lesson_date, p.hour, p.minute)
+    with requests.Session() as session:
+        candidates = build_candidates(raw_identifier, session)
+        chosen = select_candidate(candidates, p.lesson_date, p.hour, p.minute)
 
-    print(f"[info] Selected RAW={chosen.filename} Berlin={chosen.berlin_dt:%Y-%m-%d %H:%M:%S}")
+        print(f"[info] Selected RAW={chosen.filename} Berlin={chosen.berlin_dt:%Y-%m-%d %H:%M:%S}")
 
-    out_name = final_filename(p)
-    tmp_path = download_raw_to_file(raw_identifier, chosen.filename, session)
+        out_name = final_filename(p)
+        tmp_path = download_raw_to_file(raw_identifier, chosen.filename, session)
 
-    meta = {
-        "mediatype": "audio",
-        "title": "FSPneu Upload",
-        "language": "deu",
-        "creator": "ProtokolFSP",
-        "date": p.lesson_date.isoformat(),
-    }
+        try:
+            meta = {
+                "mediatype": "audio",
+                "title": "FSPneu Upload",
+                "language": "deu",
+                "creator": "ProtokolFSP",
+                "date": p.lesson_date.isoformat(),
+            }
 
-    ia_put_with_metadata(
-        session=session,
-        ia_access_key=ia_access_key,
-        ia_secret_key=ia_secret_key,
-        identifier=target_identifier,
-        filename=out_name,
-        file_path=tmp_path,
-        metadata=meta,
-    )
+            ia_put_with_metadata(
+                session=session,
+                ia_access_key=ia_access_key,
+                ia_secret_key=ia_secret_key,
+                identifier=target_identifier,
+                filename=out_name,
+                file_path=tmp_path,
+                metadata=meta,
+            )
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     print(json.dumps({"ok": True, "final_filename": out_name, "raw_filename": chosen.filename}, ensure_ascii=False))
     return 0
@@ -387,6 +395,7 @@ if __name__ == "__main__":
     except PublishError as e:
         print(f"[error] {e}", file=sys.stderr)
         raise SystemExit(2)
-    except Exception as e:
-        print(f"[error] Unexpected: {e}", file=sys.stderr)
+    except Exception:
+        print("[error] Unexpected exception", file=sys.stderr)
+        traceback.print_exc()
         raise SystemExit(3)
