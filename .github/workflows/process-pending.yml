@@ -67,85 +67,104 @@ jobs:
 
           @dataclass
           class Result:
-            published: int
-            remaining: int
-            first_hard_error: Optional[int]
+              published: int
+              remaining: int
+              first_hard_error: Optional[int]
 
 
           def load_queue(path: str) -> Dict[str, Any]:
-            if not os.path.exists(path):
-              return {"pending": []}
-            with open(path, "r", encoding="utf-8") as f:
-              data = json.load(f)
-            if not isinstance(data, dict):
-              return {"pending": []}
-            pending = data.get("pending", [])
-            if not isinstance(pending, list):
-              pending = []
-            data["pending"] = pending
-            return data
+              if not os.path.exists(path):
+                  return {"pending": []}
+              with open(path, "r", encoding="utf-8") as f:
+                  data = json.load(f)
+              if not isinstance(data, dict):
+                  return {"pending": []}
+              pending = data.get("pending", [])
+              if not isinstance(pending, list):
+                  pending = []
+              data["pending"] = pending
+              return data
 
 
           def save_queue(path: str, data: Dict[str, Any]) -> None:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-              json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
-              f.write("\n")
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w", encoding="utf-8") as f:
+                  json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+                  f.write("\n")
 
 
           def run_publish(line: str) -> int:
-            p = subprocess.run([sys.executable, "tools/publish_from_raw.py", "--line", line])
-            return int(p.returncode)
+              print(f"[queue] processing line={line!r}", flush=True)
+              p = subprocess.run(
+                  [sys.executable, "tools/publish_from_raw.py", "--line", line],
+                  capture_output=True,
+                  text=True,
+              )
+              print(f"[queue] rc={p.returncode} line={line!r}", flush=True)
+              if p.stdout:
+                  print("[queue][stdout]")
+                  print(p.stdout.rstrip())
+              if p.stderr:
+                  print("[queue][stderr]")
+                  print(p.stderr.rstrip())
+              return int(p.returncode)
 
 
           def process(data: Dict[str, Any]) -> Result:
-            pending: List[Dict[str, Any]] = list(data.get("pending", []))
-            if not pending:
-              print("queue empty")
-              return Result(published=0, remaining=0, first_hard_error=None)
+              pending: List[Dict[str, Any]] = list(data.get("pending", []))
+              if not pending:
+                  print("queue empty")
+                  return Result(published=0, remaining=0, first_hard_error=None)
 
-            keep: List[Dict[str, Any]] = []
-            published = 0
-            first_hard_error: Optional[int] = None
-            processed = 0
+              keep: List[Dict[str, Any]] = []
+              published = 0
+              first_hard_error: Optional[int] = None
+              processed = 0
 
-            for item in pending:
-              if MAX_PER_RUN and processed >= MAX_PER_RUN:
-                keep.append(item)
-                continue
+              for item in pending:
+                  if MAX_PER_RUN and processed >= MAX_PER_RUN:
+                      keep.append(item)
+                      continue
 
-              if not isinstance(item, dict):
-                continue
+                  if not isinstance(item, dict):
+                      continue
 
-              line = str(item.get("line", "")).strip()
-              if not line:
-                continue
+                  line = str(item.get("line", "")).strip()
+                  if not line:
+                      continue
 
-              rc = run_publish(line)
-              processed += 1
+                  rc = run_publish(line)
+                  processed += 1
 
-              if rc == 0:
-                published += 1
-                continue
+                  if rc == 0:
+                      published += 1
+                      continue
 
-              if rc == 4:
-                keep.append(item)
-                continue
+                  if rc == 4:
+                      keep.append(item)
+                      continue
 
-              keep.append(item)
-              if first_hard_error is None:
-                first_hard_error = rc
+                  keep.append(item)
+                  if first_hard_error is None:
+                      first_hard_error = rc
 
-            data["pending"] = keep
-            print(f"published={published} remaining={len(keep)} processed={processed} hard_error={first_hard_error}")
-            return Result(published=published, remaining=len(keep), first_hard_error=first_hard_error)
+              data["pending"] = keep
+              print(
+                  f"published={published} remaining={len(keep)} "
+                  f"processed={processed} hard_error={first_hard_error}"
+              )
+              return Result(
+                  published=published,
+                  remaining=len(keep),
+                  first_hard_error=first_hard_error,
+              )
 
 
           def main() -> int:
-            data = load_queue(PATH)
-            res = process(data)
-            save_queue(PATH, data)
-            return res.first_hard_error or 0
+              data = load_queue(PATH)
+              res = process(data)
+              save_queue(PATH, data)
+              return res.first_hard_error or 0
 
 
           raise SystemExit(main())
