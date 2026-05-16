@@ -1,9 +1,15 @@
-name: Process pending publish queue
+name: Publish from IA RAW to FSPneu
+run-name: "Publish: ${{ github.event.client_payload.line || inputs.line }}"
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch: {}
+  repository_dispatch:
+    types: [publish_recording]
+  workflow_dispatch:
+    inputs:
+      line:
+        description: "Exact line identifier (must match RAW exactly)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -13,14 +19,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  process:
+  publish:
     runs-on: ubuntu-latest
-
     env:
       RAW_IA_IDENTIFIER: "FSPraw"
       TARGET_IA_IDENTIFIER: "FSPneu"
       IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
       IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+      LINE: ${{ github.event.client_payload.line || inputs.line }}
 
     steps:
       - uses: actions/checkout@v4
@@ -37,150 +43,72 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Process queue
-        id: process_queue
+      - name: Validate LINE
         shell: bash
         run: |
           set -euo pipefail
+          if [ -z "${LINE}" ]; then
+            echo "LINE is missing. Provide client_payload.line for repository_dispatch or inputs.line for workflow_dispatch."
+            exit 2
+          fi
+          echo "Resolved LINE=${LINE}"
+          echo "GITHUB_REF=${GITHUB_REF}"
+          echo "GITHUB_REF_NAME=${GITHUB_REF_NAME}"
+
+      - name: Publish or queue
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+
           set +e
-          python - <<'PY'
-          """
-          Processes queue/pending.json:
-            - rc=0: remove item from queue
-            - rc=4: keep waiting
-            - else: keep item, but report hard error after persisting updated queue
-          """
-          from __future__ import annotations
-
-          import json
-          import os
-          import subprocess
-          import sys
-          from dataclasses import dataclass
-          from typing import Any, Dict, List, Optional
-
-          PATH = "queue/pending.json"
-          MAX_PER_RUN = int(os.environ.get("QUEUE_MAX_PER_RUN", "0"))
-
-
-          @dataclass
-          class Result:
-              published: int
-              remaining: int
-              first_hard_error: Optional[int]
-
-
-          def load_queue(path: str) -> Dict[str, Any]:
-              if not os.path.exists(path):
-                  return {"pending": []}
-              with open(path, "r", encoding="utf-8") as f:
-                  data = json.load(f)
-              if not isinstance(data, dict):
-                  return {"pending": []}
-              pending = data.get("pending", [])
-              if not isinstance(pending, list):
-                  pending = []
-              data["pending"] = pending
-              return data
-
-
-          def save_queue(path: str, data: Dict[str, Any]) -> None:
-              os.makedirs(os.path.dirname(path), exist_ok=True)
-              with open(path, "w", encoding="utf-8") as f:
-                  json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
-                  f.write("\n")
-
-
-          def run_publish(line: str) -> int:
-              print(f"[queue] processing line={line!r}", flush=True)
-              p = subprocess.run(
-                  [sys.executable, "tools/publish_from_raw.py", "--line", line],
-                  capture_output=True,
-                  text=True,
-              )
-              print(f"[queue] rc={p.returncode} line={line!r}", flush=True)
-              if p.stdout:
-                  print("[queue][stdout]")
-                  print(p.stdout.rstrip())
-              if p.stderr:
-                  print("[queue][stderr]")
-                  print(p.stderr.rstrip())
-              return int(p.returncode)
-
-
-          def process(data: Dict[str, Any]) -> Result:
-              pending: List[Dict[str, Any]] = list(data.get("pending", []))
-              if not pending:
-                  print("queue empty")
-                  return Result(published=0, remaining=0, first_hard_error=None)
-
-              keep: List[Dict[str, Any]] = []
-              published = 0
-              first_hard_error: Optional[int] = None
-              processed = 0
-
-              for item in pending:
-                  if MAX_PER_RUN and processed >= MAX_PER_RUN:
-                      keep.append(item)
-                      continue
-
-                  if not isinstance(item, dict):
-                      continue
-
-                  line = str(item.get("line", "")).strip()
-                  if not line:
-                      continue
-
-                  rc = run_publish(line)
-                  processed += 1
-
-                  if rc == 0:
-                      published += 1
-                      continue
-
-                  if rc == 4:
-                      keep.append(item)
-                      continue
-
-                  keep.append(item)
-                  if first_hard_error is None:
-                      first_hard_error = rc
-
-              data["pending"] = keep
-              print(
-                  f"published={published} remaining={len(keep)} "
-                  f"processed={processed} hard_error={first_hard_error}"
-              )
-              return Result(
-                  published=published,
-                  remaining=len(keep),
-                  first_hard_error=first_hard_error,
-              )
-
-
-          def main() -> int:
-              data = load_queue(PATH)
-              res = process(data)
-              save_queue(PATH, data)
-              return res.first_hard_error or 0
-
-
-          raise SystemExit(main())
-          PY
-          code=$?
+          python tools/publish_from_raw.py --line "${LINE}" 2>&1 | tee .publish_output.txt
+          code="${PIPESTATUS[0]}"
           set -e
 
           echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
-          exit 0
 
-      - name: Commit queue updates (if changed)
-        if: ${{ always() }}
+          if [ "${code}" -eq 4 ]; then
+            echo "RAW not yet available -> queueing request"
+            python tools/enqueue_pending.py --line "${LINE}"
+          elif [ "${code}" -ne 0 ]; then
+            exit "${code}"
+          fi
+
+      - name: Summary
+        if: ${{ always() && (steps.publish.outputs.exit_code == '0' || steps.publish.outputs.exit_code == '4') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          code="${{ steps.publish.outputs.exit_code }}"
+          {
+            echo "### Publish summary"
+            echo ""
+            echo "- LINE: \`${LINE}\`"
+            if [ "${code}" = "0" ]; then
+              echo "- Result: ✅ published"
+            else
+              echo "- Result: ⏳ queued (RAW not yet available)"
+            fi
+            echo ""
+            echo "#### Script output (last 200 lines)"
+            echo "\`\`\`"
+            if [ -s .publish_output.txt ]; then
+              tail -n 200 .publish_output.txt
+            else
+              echo "(no script output)"
+            fi
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit queue changes (if any)
+        if: ${{ steps.publish.outputs.exit_code == '4' }}
         shell: bash
         run: |
           set -euo pipefail
 
           if git diff --quiet -- queue/pending.json 2>/dev/null; then
-            echo "No queue updates."
+            echo "No queue changes."
             exit 0
           fi
 
@@ -188,7 +116,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add queue/pending.json
-          git commit -m "chore: process publish queue"
+          git commit -m "chore: queue publish request"
 
           for attempt in 1 2 3 4 5; do
             if git push origin "HEAD:${GITHUB_REF_NAME}"; then
@@ -201,11 +129,4 @@ jobs:
           done
 
           echo "Failed to push after retries."
-          exit 1
-
-      - name: Fail on hard publish error
-        if: ${{ always() && steps.process_queue.outputs.exit_code != '0' }}
-        shell: bash
-        run: |
-          echo "Queue processing had hard error: ${{ steps.process_queue.outputs.exit_code }}"
           exit 1
