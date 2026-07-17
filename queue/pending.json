@@ -67,6 +67,10 @@
     {
       "line": "Pankreas Kopf Karsinom; Heiko; Derya; 25.06.2026; 18:00",
       "queued_at_utc": "2026-06-26T20:02:48.893433+00:00"
+    },
+    {
+      "line": "Appendizitis; Fr Gerhild; Dr.Fatma; 23.02.2026; 20:00",
+      "queued_at_utc": "2026-07-17T00:50:00.581496+00:00"
     }
   ]
 }
