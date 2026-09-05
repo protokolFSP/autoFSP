@@ -71,6 +71,10 @@
     {
       "line": "Appendizitis; Fr Gerhild; Dr.Fatma; 23.02.2026; 20:00",
       "queued_at_utc": "2026-07-17T00:50:00.581496+00:00"
+    },
+    {
+      "line": "Akute Cholezystitis; Dr Zehra Betul; Dr Kadriye; 05.09.2026; 12:10",
+      "queued_at_utc": "2026-09-05T11:58:19.422846+00:00"
     }
   ]
 }
