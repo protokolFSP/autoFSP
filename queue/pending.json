@@ -79,10 +79,6 @@
     {
       "line": "Leukemie; Fr Gerhild; Dr Toprak; 23.09.2026; 20:02",
       "queued_at_utc": "2026-09-22T19:12:36.486225+00:00"
-    },
-    {
-      "line": "Colitis Ulcerosa; Dr Murat; Dr Furkan; 04.10.2026; 12:00",
-      "queued_at_utc": "2026-10-04T12:02:31.482320+00:00"
     }
   ]
 }
