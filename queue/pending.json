@@ -79,6 +79,10 @@
     {
       "line": "Leukemie; Fr Gerhild; Dr Toprak; 23.09.2026; 20:02",
       "queued_at_utc": "2026-09-22T19:12:36.486225+00:00"
+    },
+    {
+      "line": "Hyperthyreose; Dr Heiko; Dr Furkan; 15.10.2026; 18:00",
+      "queued_at_utc": "2026-10-15T18:32:41.901067+00:00"
     }
   ]
 }
