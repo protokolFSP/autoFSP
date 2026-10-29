@@ -79,6 +79,10 @@
     {
       "line": "Leukemie; Fr Gerhild; Dr Toprak; 23.09.2026; 20:02",
       "queued_at_utc": "2026-09-22T19:12:36.486225+00:00"
+    },
+    {
+      "line": "Akute Divertikulitis; Fr Gerhild; Dr Furkan; 22.10.2026; 20:00",
+      "queued_at_utc": "2026-10-29T20:58:56.237168+00:00"
     }
   ]
 }
